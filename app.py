@@ -14,35 +14,16 @@ mysql_password_local = os.getenv("MYSQL_PASSWORD_LOCAL")
 # requirement queries:
 
 queries = {
-    "function": "SELECT CONCAT(firstname, ' ', lastname) AS fullname FROM employee",
-    "inner join": """SELECT     f.flight_id, 
-    f.flightno,
-    f.`from`   AS from_airport,
-    f.`to`     AS to_airport,
-    f.departure,
-    f.arrival,
-    f.airline_id AS flight_airline_id,
-    a.airline_id AS airline_airline_id,
-    a.iata,
-    a.airlinename,
-    a.base_airport FROM flight AS f INNER JOIN airline AS a ON f.airline_id = a.airline_id""",
-    "conditional logic": """SELECT
-    flight_id,
-    flightno,
-    TIMESTAMPDIFF(MINUTE, departure, arrival) AS duration_minutes,
-    CASE
-        WHEN TIMESTAMPDIFF(MINUTE, departure, arrival) < 120
-            THEN 'Short Haul'
-        WHEN TIMESTAMPDIFF(MINUTE, departure, arrival) BETWEEN 120 AND 360
-            THEN 'Medium Haul'
-        ELSE 'Long Haul'
-    END AS flight_type
-FROM flight
-ORDER BY duration_minutes;""",
-    "outer join": "SELECT * FROM flight LEFT OUTER JOIN airline ON flight.airline_id = airline.airline_id",
-    "aggregate function and GROUP BY": "SELECT * FROM flight",
-    "subquery": "SELECT * FROM flight",
-    "window function": "SELECT * FROM flight"
+    "Scriptures by Year": """
+        SELECT year_of_event, age, book, chapter, verse
+        FROM timeline
+        ORDER BY year_of_event
+    """,
+    "Doctrine Counts": """
+        SELECT doctrine_name, COUNT(*) AS count
+        FROM timeline
+        GROUP BY doctrine_name
+    """
 }
 
 
@@ -123,7 +104,7 @@ def run_query(sql: str, limit: int):
 @st.cache_data
 def load_chart_data():
     conn, tunnel = get_connection()
-    df = pd.read_sql("SELECT * FROM airportdb.flight_view WHERE `date` BETWEEN '2015-08-01' and '2015-09-01'", conn)
+    df = pd.read_sql("SELECT year_of_event, book FROM timeline", conn)
     conn.close()
     tunnel.stop()
     return df
@@ -167,17 +148,17 @@ def hash_df(df):
 
 # ---------- STREAMLIT APP ----------
 
-st.title("📊 Flight Analytics and Passenger Dashboard")
+st.title("Scripture Study Timeline Analysis")
 
 # Line chart from DB view
-st.subheader("📈 Flight Counts")
+st.subheader("Book Events Over Years")
 chart_df = load_chart_data()
-chart_df['date'] = pd.to_datetime(chart_df['date'])
-pivot_df = chart_df.pivot(index='date', columns='airlinename', values='flights_count')
+chart_df['yi.year_of_event'] = pd.to_datetime(chart_df['yi.year_of_event'])
+pivot_df = chart_df.pivot(index='yi.year_of_event', columns='Years', values='book')
 st.line_chart(pivot_df)
 
 # Editable table
-st.subheader("👤 Manage Passengers (Add, Edit, Delete)")
+st.subheader("👤 Manage Entries (Add, Edit, Delete)")
 
 # Load passengers table
 if "original_df" not in st.session_state:
