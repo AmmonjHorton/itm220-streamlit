@@ -6,6 +6,7 @@ import hashlib
 from mysql.connector import Error
 from sshtunnel import SSHTunnelForwarder
 from dotenv import load_dotenv
+import altair as alt
 load_dotenv()
 
 mysql_password = os.getenv("MYSQL_PASSWORD")
@@ -15,15 +16,72 @@ mysql_password_local = os.getenv("MYSQL_PASSWORD_LOCAL")
 
 queries = {
     "Scriptures by Year": """
-        SELECT year_of_event, age, book, chapter, verse
-        FROM timeline
-        ORDER BY year_of_event
+        SELECT yi.year_of_event, age, book, chapter, verse,
+        CASE
+        WHEN yi.age = 'BC' THEN -yi.year_of_event
+        ELSE yi.year_of_event
+        END AS year_timeline
+        FROM year_info AS yi
+        INNER JOIN scripture_study AS ss
+        ON yi.scripture_study_id = ss.id
+        ORDER BY year_timeline
     """,
     "Doctrine Counts": """
         SELECT doctrine_name, COUNT(*) AS count
         FROM timeline
         GROUP BY doctrine_name
+    """,
+    "Conditional Logic Example": """
+    SELECT volume, book, chapter, verse,
+    CASE
+        WHEN volume = 'Old Testament' THEN 'OT'
+        WHEN volume = 'New Testament' THEN 'NT'
+        WHEN volume = 'Book of Mormon' THEN 'BOM'
+        WHEN volume = 'Doctrine and Covenants' THEN 'D&C'
+        WHEN volume = 'Pearl of Great Price' THEN 'PGP'
+        ELSE 'Other'
+        END AS volume_abbr
+    FROM scripture_study
+    ORDER BY volume_abbr
+    """,
+    "Outer Join Example": """
+    SELECT ss.volume, ss.book, ss.chapter, ss.verse, yi.year_of_event, d.doctrine_name
+    FROM scripture_study AS ss
+    LEFT OUTER JOIN year_info AS yi ON ss.id = yi.scripture_study_id
+    LEFT OUTER JOIN doctrine AS d ON ss.id = d.scripture_study_id
+    ORDER BY ss.volume, ss.book
+    """,
+    "Group By Example": """
+    SELECT ss.volume, COUNT(*) AS scripture_count
+    FROM scripture_study AS ss
+    GROUP BY ss.volume
+    ORDER BY scripture_count DESC 
+""",
+    "Subqueries Example": """
+    SELECT volume, book, chapter, verse
+    FROM scripture_study
+    WHERE id IN (
+        SELECT scripture_study_id
+        FROM year_info
+        WHERE age = 'BC'
+    )
+    ORDER BY volume, book    
+""",    ### I want to want this query to return the percentage of entries
+        ###each volume takes up out of the total scripture_study entries.
+    "Window Functions Example": """
+    SELECT
+        volume,
+        volume_count,
+        volume_count / SUM(volume_count) OVER () * 100 AS pct_of_total
+    FROM (SELECT
+        volume,
+        COUNT(*) AS volume_count
+    FROM scripture_study
+    GROUP BY volume) AS volume_counts
+    ORDER BY pct_of_total DESC;
+
     """
+
 }
 
 
@@ -54,9 +112,30 @@ def get_connection():
         return None
     
 @st.cache_data
-def load_passengers():
+def load_timeline():
     conn, tunnel = get_connection()
-    df = pd.read_sql("SELECT * FROM passenger", conn)
+    df = pd.read_sql("""
+SELECT timeline_year, year_of_event, age,
+volume, book, chapter, verse, doctrine_name
+FROM timeline
+ORDER BY timeline_year
+""", conn)
+    conn.close()
+    tunnel.stop()
+    return df
+
+
+@st.cache_data
+def load_scriptures():
+    """Load scripture_study rows (keeps function name for UI compatibility).
+    Returns columns: volume, book, chapter, verse
+    """
+    conn, tunnel = get_connection()
+    df = pd.read_sql("""
+        SELECT id, volume, book, chapter, verse
+        FROM scripture_study
+        ORDER BY id
+        """, conn)
     conn.close()
     tunnel.stop()
     return df
@@ -104,47 +183,93 @@ def run_query(sql: str, limit: int):
 @st.cache_data
 def load_chart_data():
     conn, tunnel = get_connection()
-    df = pd.read_sql("SELECT year_of_event, book FROM timeline", conn)
+    df = pd.read_sql("""
+        SELECT timeline_year, year_of_event, age, book
+        FROM timeline
+        ORDER BY timeline_year
+        """, conn)
     conn.close()
     tunnel.stop()
     return df
 
 def update_rows(updated_df, original_df):
-    conn = get_connection()
+    conn, tunnel = get_connection()
     cursor = conn.cursor()
     
     for i, row in updated_df.iterrows():
         original_row = original_df.loc[i]
         if not row.equals(original_row):
             cursor.execute(
-                "UPDATE passenger SET passportno=%s, firstname=%s, lastname=%s WHERE passenger_id=%s",
-                (row['passportno'], row['firstname'], row['lastname'], row['passenger_id'])
+                "UPDATE scripture_study SET volume=%s, book=%s, chapter=%s, verse=%s WHERE id=%s",
+                (row.get('volume'), row.get('book'), row.get('chapter'), row.get('verse'), row.get('id'))
             )
     conn.commit()
     conn.close()
+    tunnel.stop()
 
 def delete_rows(ids_to_delete):
-    format_strings = ",".join( map(str, ids_to_delete))
-    print(f"format_strings: {format_strings}")
-    print(f"Deleting rows with IDs: {ids_to_delete}")
+    if not ids_to_delete:
+        return
+    placeholders = ",".join(["%s"] * len(ids_to_delete))
     conn, tunnel = get_connection()
     cursor = conn.cursor()
-
-    cursor.execute(f"DELETE FROM passenger WHERE passenger_id IN ({format_strings})")
+    sql = f"DELETE FROM scripture_study WHERE id IN ({placeholders})"
+    cursor.execute(sql, tuple(ids_to_delete))
     conn.commit()
     conn.close()
+    tunnel.stop()
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
 
-def insert_row(passportno, firstname, lastname):
+def insert_row(volume, book, chapter, verse, age=None, year_of_event=None, doctrine_name=None):
+    # Insert a scripture_study row and optionally related year_info and doctrine rows
     conn, tunnel = get_connection()
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO passenger (passportno, firstname, lastname) VALUES (%s, %s, %s)", (passportno, firstname, lastname))
+    cursor.execute(
+        "INSERT INTO scripture_study (volume, book, chapter, verse) VALUES (%s, %s, %s, %s)",
+        (volume, book, chapter, verse),
+    )
+    scripture_id = cursor.lastrowid
+
+    # Insert year_info if both year and age are provided
+    try:
+        if year_of_event and age:
+            # Ensure year_of_event is numeric if supplied as string
+            cursor.execute(
+                "INSERT INTO year_info (year_of_event, age, scripture_study_id) VALUES (%s, %s, %s)",
+                (int(year_of_event), age, scripture_id),
+            )
+    except Exception:
+        # If conversion fails or insert fails, ignore and continue
+        pass
+
+    # Insert doctrine if provided
+    if doctrine_name:
+        try:
+            cursor.execute(
+                "INSERT INTO doctrine (scripture_study_id, doctrine_name) VALUES (%s, %s)",
+                (scripture_id, doctrine_name),
+            )
+        except Exception:
+            pass
+
     conn.commit()
     conn.close()
+    tunnel.stop()
+    # Clear cached loads so the new row appears on next read
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
 
 # ---------- HELPER FUNCTIONS ----------
 
 def hash_df(df):
-    return hashlib.md5(pd.util.hash_pandas_object(df, index=True).values).hexdigest()
+    # Create a stable byte representation of the dataframe hashes
+    h = pd.util.hash_pandas_object(df, index=True)
+    return hashlib.md5(h.to_numpy().tobytes()).hexdigest()
 
 # ---------- STREAMLIT APP ----------
 
@@ -152,37 +277,73 @@ st.title("Scripture Study Timeline Analysis")
 
 # Line chart from DB view
 st.subheader("Book Events Over Years")
-chart_df = load_chart_data()
-chart_df['yi.year_of_event'] = pd.to_datetime(chart_df['yi.year_of_event'])
-pivot_df = chart_df.pivot(index='yi.year_of_event', columns='Years', values='book')
-st.line_chart(pivot_df)
+# Build a layered Altair chart: line of event counts per year + markers for each event with labels
+events = load_timeline()
+if not events.empty:
+    counts = events.groupby("timeline_year").size().reset_index(name="count")
+    events = events.merge(counts, on="timeline_year")
+    # Compose a readable label for each event
+    events["label"] = events.apply(
+        lambda r: f"{r.get('book','')} {r.get('chapter','')}:{r.get('verse','')} ({abs(r.get('year_of_event',0))} {r.get('age','')})",
+        axis=1,
+    )
+
+    line = alt.Chart(counts).mark_line(point=True).encode(
+        x=alt.X("timeline_year:Q", title="Year"),
+        y=alt.Y("count:Q", title="Events"),
+        tooltip=[alt.Tooltip("timeline_year:Q", title="Timeline Year"), alt.Tooltip("count:Q", title="Events")],
+    )
+
+    points = alt.Chart(events).mark_circle(color="#d62728", size=60).encode(
+        x="timeline_year:Q",
+        y="count:Q",
+        tooltip=[
+            alt.Tooltip("book:N", title="Book"),
+            alt.Tooltip("chapter:N", title="Chapter"),
+            alt.Tooltip("verse:N", title="Verse"),
+            alt.Tooltip("year_of_event:Q", title="Year of Event"),
+            alt.Tooltip("doctrine_name:N", title="Doctrine"),
+        ],
+    )
+
+    # Text labels placed slightly above the point
+    text = alt.Chart(events).mark_text(align="left", dx=5, dy=-10, fontSize=10).encode(
+        x="timeline_year:Q",
+        y="count:Q",
+        text="label:N",
+    )
+
+    chart = alt.layer(line, points, text).interactive().properties(height=350)
+    st.altair_chart(chart, use_container_width=True)
+else:
+    st.info("No timeline events to display.")
+
 
 # Editable table
-st.subheader("👤 Manage Entries (Add, Edit, Delete)")
+st.subheader("📜 Manage Scripture Entries (Add, Edit, Delete)")
 
-# Load passengers table
+# Load scripture_study table as the editable dataset
 if "original_df" not in st.session_state:
-    st.session_state.original_df = load_passengers()
-
-df = st.session_state.original_df.copy()
-df["delete"] = False
-edited_df = st.data_editor(df, num_rows="fixed", hide_index=True, column_order=("passportno", "firstname", "lastname", "delete"), use_container_width=True)
-
-
-# Load initial data
-if "original_df" not in st.session_state:
-    st.session_state.original_df = load_passengers()
+    st.session_state.original_df = load_scriptures()
     st.session_state.original_hash = hash_df(st.session_state.original_df)
 
 df = st.session_state.original_df.copy()
+df["delete"] = False
+edited_df = st.data_editor(
+    df,
+    num_rows="fixed",
+    hide_index=True,
+    column_order=("volume", "book", "chapter", "verse", "delete"),
+    use_container_width=True,
+)
 
 # Delete selected rows
 if st.button("🗑️ Delete Selected Rows"):
-    selected_ids = edited_df[edited_df["delete"] == True]["passenger_id"].tolist()
+    selected_ids = edited_df[edited_df["delete"] == True]["id"].tolist()
     if selected_ids:
         print(f"Deleting rows with IDs: {selected_ids}")
         delete_rows(selected_ids)
-        st.session_state.original_df = load_passengers()
+        st.session_state.original_df = load_scriptures()
         st.session_state.original_hash = hash_df(st.session_state.original_df)
         st.success(f"Deleted {len(selected_ids)} row(s).")
         st.rerun()
@@ -202,21 +363,33 @@ if st.button("💾 Save Edits"):
         st.info("No changes detected.")
 
 # Insert new row
-st.subheader("➕ Add New Passenger")
+st.subheader("➕ Add New Entry")
 with st.form("insert_form"):
-    new_passportno = st.text_input("Passport Number")
-    new_firstname = st.text_input("First Name")
-    new_lastname = st.text_input("Last Name")
-    submitted = st.form_submit_button("Add Passenger")
+    new_volume = st.text_input("Volume")
+    new_book = st.text_input("Book")
+    new_chapter = st.text_input("Chapter")
+    new_verse = st.text_input("Verse")
+    new_doctrine = st.text_input("Doctrine Name")
+    new_year = st.text_input("Year of Event")
+    new_age = st.text_input("Age")
+    submitted = st.form_submit_button("Add Entry")
 
     if submitted:
-        if new_passportno.strip() == "" or new_firstname.strip() == "" or new_lastname.strip() == "":
-            st.warning("Passport Number, First Name, and Last Name are required.")
+        if new_volume.strip() == "" or new_book.strip() == "":
+            st.warning("Volume and Book are required (chapter/verse optional).")
         else:
-            insert_row(new_passportno.strip(), new_firstname.strip(), new_lastname.strip())
-            st.session_state.original_df = load_passengers()
+            insert_row(
+                new_volume.strip(),
+                new_book.strip(),
+                new_chapter.strip(),
+                new_verse.strip(),
+                new_age.strip(),
+                new_year.strip(),
+                new_doctrine.strip(),
+            )
+            st.session_state.original_df = load_scriptures()
             st.session_state.original_hash = hash_df(st.session_state.original_df)
-            st.success(f"Passenger '{new_firstname}' '{new_lastname}' added.")
+            st.success(f"Scripture entry '{new_volume}' '{new_book}' added.")
             st.rerun()
 
 # Selectbox for requirement queries with limit slider
